@@ -1,0 +1,25 @@
+model
+{
+  for( t in 1:N ){
+    for( i in 1:M){
+      r[t, i] ~ dnorm(mu[i], prec[i])  
+    }
+  }
+  
+  for( j  in 1:M ){
+    # Tau^2 - Precision
+    prec[j] ~ dgamma(s, lambda)
+    
+    # Mu - Average Returns
+    mu[j] ~ dnorm(alpha, 1/beta)
+    
+    # Sigma - Volatility
+    sigma[j] <- sqrt(1 / prec[j])
+    
+    # Returns Distribution
+    returns[j] ~ dnorm(mu[j], prec[j])
+    
+    # Sharpe Ratio
+    sharpe[j] <- mu[j] / sigma[j] * sqrt(12)
+  }
+}

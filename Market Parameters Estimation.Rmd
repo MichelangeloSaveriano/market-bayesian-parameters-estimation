@@ -1,0 +1,788 @@
+---
+title: "MarketDrift"
+author: "Michelangelo Saveriano"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+
+if (!require("plyr")) {install.packages("plyr"); library(plyr)}
+if (!require("tseries")) {install.packages("tseries"); library(tseries)}
+if (!require("invgamma")) {install.packages("invgamma"); library(invgamma)}
+if (!require("R2jags")) {install.packages("R2jags"); library(R2jags)}
+if (!require("latex2exp")) {install.packages("latex2exp"); library(latex2exp)}
+if (!require("ggplot2")) {install.packages("ggplot2"); library(ggplot2)}
+if (!require("qqplotr")) {install.packages("qqplotr"); library(qqplotr)}
+if (!require("RColorBrewer")) {install.packages("RColorBrewer"); library(RColorBrewer)}
+if (!require("ggmcmc")) {install.packages("ggmcmc"); library(ggmcmc)}
+if (!require("LaplacesDemon")) {install.packages("LaplacesDemon"); library(LaplacesDemon)}
+if (!require("stringr")) {install.packages("stringr"); library(stringr)}
+if (!require("reshape")) {install.packages("reshape"); library(reshape)}
+if (!require("changepoint")) {install.packages("changepoint"); library(changepoint)}
+if (!require("corrplot")) {install.packages("corrplot"); library(corrplot)}
+if (!require("quantmod")) {install.packages("quantmod"); library(quantmod)}
+if (!require("bayesplot")) {install.packages("bayesplot"); library(bayesplot)}
+
+set.seed(1234)
+substrRight <- function(x, n) substr(x, nchar(x)-n+1, nchar(x))
+theme_set(theme_minimal())
+weight_threshold <- 0.7 # %
+```
+
+
+# Introduction
+
+This project aims to infer the expected returns and volatility of a number of stocks, comparing models with correlated and uncorrelated perturbations in order to then construct a portfolio able to maximize future returns while keeping bounded the variance. One of the most widely used methods for calculating risk-adjusted return (*risk = variance*) is the Sharpe ratio and it is computed as follows:
+
+$$
+SR = \frac{R_p - R_f}{\sigma_p}
+$$
+
+where:
+
+* $R_p$ is the return of the portfolio;
+* $R_f$ is the return of a risk-free asset, in our case it is $0$;
+* $\sigma_p$ is the standard deviation of the portfolio.
+
+The data we will use are the monthly prices of a selection of the largest stocks in the **SP500** index, the data from $2015-01-01$ to $2021-01-01$ are used for the training while the data from $2021-01-01$ to the $2022-06-01$ are used in the testing part. The models we will define rely on the **random walk hypothesis**. 
+
+# The Data
+
+### Description
+
+As mentioned above the data we are using is the monthly closing price of all the companies which weigh for more than  `r weight_threshold`% in the **SP500** index, weights updated at early $2022$. The companies that satisfy this condition are
+
+```{r, echo=FALSE, cache=TRUE}
+sp <- read.csv('sp500.csv', stringsAsFactors = FALSE)
+sp_filt <- sp[sp$Weight > weight_threshold, names(sp) != 'SEC_filings']
+sp_filt <- sp_filt[order(sp_filt$Weight, decreasing = T),]
+rownames(sp_filt) <- NULL
+M <- nrow(sp_filt)
+
+gics <- sp_filt$GICS
+names(gics) <- sp_filt$Symbol
+
+company <- sp_filt$Company
+names(company) <- sp_filt$Symbol
+
+tickers <- sp_filt$Symbol
+knitr::kable(sp_filt)
+```
+
+Now that we have selected the `r length(tickers)` companies we are interested in we can download and plot the closing prices.
+To visualize the price evolution over time we plot the log prices shifted down so that they all start at $0$ and we group companies by their *GICS* (Global Industry Classification Standard).
+
+```{r, cache=TRUE}
+price_list <- lapply(tickers, function(ticker) {
+  drop(coredata(getSymbols(ticker, from = '2015-01-01', to = "2022-06-05", 
+                           warnings = FALSE, auto.assign = FALSE)[, paste0(ticker, '.Close')]))})
+names(price_list) <- tickers
+date_daily <- sapply(index(getSymbols(tickers[1], from = '2015-01-01', to = "2022-06-05", 
+                                warnings = FALSE, auto.assign = FALSE)), 
+               toString)
+
+prices <- data.frame(price_list)
+
+index <- c(TRUE, diff(c(0, as.numeric(substrRight(date_daily, 2)))) < 0)
+
+log_prices <- log2(prices[index,])
+log_prices <- log_prices - log_prices[rep(1, nrow(log_prices)),]
+row.names(log_prices) <- NULL
+
+date_str <- date_daily[index]
+date <- as.Date(date_str)
+
+year <- as.numeric(substr(date_str, 1, 4))
+train_index <- year < 2021
+test_index <- year >= 2021
+```
+
+```{r, cache=FALSE, echo=FALSE, out.width = '100%'}
+melted_log_prices <- cbind(date = date, log_prices) %>% 
+  melt(id.vars='date')
+melted_log_prices %>%
+  cbind(GICS = gics[melted_log_prices$variable]) %>%
+  ggplot(aes(x=date, y=value, col=variable)) +
+  geom_line() +
+  geom_vline(xintercept = as.Date("2021-01-01"), lty=2, alpha=.5) + 
+  ylab('Log-Price') +
+  xlab('Date') +
+  facet_wrap(~ GICS)
+```
+
+Here we can see how the companies have behaved during the time interval in particular we can notice that
+
+* *TLSA* is clearly an outlier, it has shown an explosive growth between mid-2019 and end 2020 outperforming all the other stocks;
+* the firms belonging to the *Financial* sector seem to be high correlated;
+* many of the most capitalized firms in the SP500 are *Information Technology* firms.
+
+Evaluating the difference between log price at time $t$ and log price at time $t-1$ we can compute the **log-returns** $r_t = log_2(P_t) - log_2(P_{t-1})$.
+
+```{r, cache=TRUE}
+log_returns <- apply(log_prices, 2, diff)
+```
+
+### Statistics and Distributions
+
+Using this data we can now evaluate some basic statistics for each stock like:
+
+* minimum and maximum values;
+* mean returns;
+* median returns;
+* returns standard deviation, ie *volatility*;
+* Sharpe ratio.
+
+Subsequently we plot also the returns distribution for each stock together with the max-likelihood normal density estimated for each stock (*dashed blue line*).
+
+
+```{r, cache=FALSE, echo=FALSE, out.width = '100%', fig.width = 11, fig.height=5, warning=FALSE}
+knitr::kable(data.frame(min = apply(log_returns, 2, min), 
+                        mean = apply(log_returns, 2, mean),
+                        median = apply(log_returns, 2, median), 
+                        max = apply(log_returns, 2, max), 
+                        sd = apply(log_returns, 2, sd), 
+                        sharpe = apply(prices, 2, sharpe)))
+
+melted_log_returns <- melt(log_returns)
+colnames(melted_log_returns)[colnames(melted_log_returns) == 'X2'] <- 'stock'
+
+grid <- with(melted_log_returns, seq(min(value), max(value), length = 100))
+normaldens <- ddply(melted_log_returns, "stock", function(df) {
+  data.frame( 
+    return = grid,
+    density = dnorm(grid, mean(df$value), sd(df$value))
+  )
+})
+melted_log_returns %>%
+  cbind(GICS = gics[melted_log_returns$stock]) %>%
+  ggplot(aes(x=value, fill=stock)) +
+  geom_density(alpha=.3) +
+  geom_line(aes(x=return, y = density), data = normaldens, lwd=1, lty=2, colour = "darkblue") +
+  scale_x_continuous(breaks = c(-.3, -.15, 0, .15, .3), limits = c(-.35, .35)) + 
+  xlab('Log-Return') +
+  ylab('Density') +
+  facet_wrap(~ stock, ncol = 6)
+```
+
+From these we can derive some considerations:
+
+* the Sharpe ratio, by construction, tends to penalize highly volatile stocks, i.e. TSLA and NVDA, preferring more stable returns like UNH, AAPL and MSFT.
+* the closeness between the empirical distributions and the normal ones pushes us to test the normality of the returns.
+
+### Normality Test
+
+To test the normality we run a **Shapiro test** and show the **Q-Q Plot**. In particular in the table below we can see the probability that each stock returns follows a normal distribution.
+
+```{r, cache=FALSE, echo=FALSE, out.width = '100%', fig.width = 7, fig.height=4, warning=FALSE}
+knitr::kable(t(data.frame("p-value"=apply(log_returns, 2, function(x) shapiro.test(x)$p.value)[1:9])))
+knitr::kable(t(data.frame("p-value"=apply(log_returns, 2, function(x) shapiro.test(x)$p.value)[10:18])))
+
+melted_log_returns %>%
+ggplot(mapping = aes(sample=value, col=stock)) +
+  geom_qq() + 
+  geom_qq_line(color="darkblue") + 
+  xlab("Theoretical") +
+  ylab("Sample") +
+  facet_wrap( ~ stock, ncol = 6)
+```
+
+As we can see many stocks follow a normal distribution with an high probability, i.e. *MSFT*, *BRK.B* and *PG*, while others clearly don't, in particular *FB*, *TSLA*, *NVDA*, *JPM* and *HD*.
+
+### Correlations
+
+As last step of our *EDA* we plot the **Correlation matrix**. 
+
+```{r, cache=TRUE, echo=FALSE, fig.align='center'}
+corrplot(cor(log_returns), type="upper", col=brewer.pal(n=10, name="RdBu"))
+```
+
+In particular we can notice that:
+
+* *PG* is the less correlated stock, this can be explained noticing that it is the only firm in the **Consumer Staples** category;
+* *GOOGL* and *GOOG* show almost perfect correlation since they both refer to the **Alphabet** company;
+* two couples show an extremely high correlation *JPM-BAC* and *V-MA*, probably this is due to the fact that the companies that make up the couples sell almost interchangeably products.
+
+# Random Walk Hypothesis
+
+A well known hypothesis in the financial industry is the random walk hypothesis. This states that stock market prices follows a **Geometric Brownian Motion**.
+
+The Brownian motion is the random motion of particles suspended in a medium and can be described mathematically by the Wiener process $W_t$.
+A geometric Brownian motion (GBM) is a continuous-time stochastic process in which the logarithm of the process follows a Brownian motion, often with a drift. It can be defined as the process that satisfies the following stochastic differential equation (SDE):
+
+$$
+d S_t = \mu S_t d t + \sigma S_t dW_t
+$$
+where $W_t$ is a Wiener process, $\mu$ is the drift and $\sigma$ is the amount of volatility.
+
+Rewriting the former SDE into
+
+$$
+\frac{d S_t}{S_t} = R_t = \mu dt + \sigma dW_t
+$$
+
+we can interpret it as the percentage change at time step $t$, $R_t$, is equal to a constant drift plus the Wiener process increment times the volatility term. 
+ 
+A simpler expression complying with the hypothesis, in the case of unitary time step, $dt = t - (t-1) = 1$, is the following:
+
+$$
+r_t = X_t - X_{t-1} = \mu + \epsilon_t
+$$
+where $\epsilon_t$ is a  random  disturbance with $\mathbb{E}[\epsilon_t]=0$ and $\mathbb{E}[\epsilon_t \epsilon_\tau] = 0$ and $r_t$ is the log-return at time $t$ we have defined above. 
+
+Although this hypothesis has been disproof many times in the last decades it is also true that predicting stock returns is all but trivial. In particular, in the plots below, we can see that the returns for a given stock are uncorrelated across time.
+
+```{r, echo=FALSE, fig.width = 7, fig.height=4, out.width = '100%'}
+acf(log_returns[, 'AAPL'], main='ACF - Apple')
+```
+
+Using more sophisticated measure like *K2* (lower bound for the **Kolmogorov Entropy**) we notice how the stock returns entropy $S(t)$ approaches the entropy of a **geometric brownian motion** simulated using pseudo-random numbers.
+
+![](KolmogorovEntropyPlot.png)
+
+# The Models
+
+In this section we will run two model and compare the results obtained. For each model we will:
+
+* describe analytically the model and the prior distribution used as well as the choice of the hyper-parameters;
+* implement and run the *JAGS* model;
+* analyze the convergence of the *MCMC*;
+* describe and plot the results obtained
+* evaluate the performance of the model on new unseen test data.
+
+## Uncorrelated Noise
+
+In the first model we take into account we assume that the returns of different stocks are independent each other.
+
+### Prior Distributions
+
+We model $\epsilon_t$ as iid $\mathcal{N}(0, \sigma)$ therefore the log-returns at time step $t$ follows a normal distribution with the following parameters
+
+$$
+r_t \sim \mathcal{N}(\mu, \sigma)
+$$
+
+Due to the small amount of samples we have for each asset, $N=`r sum(train_index)`$, the point estimates for $\mu$ and $\sigma$ might be unreliable therefore for each stock $i$ we consider the following prior distributions:
+
+$$
+\begin{align}
+r_i &\sim \mathcal{N}(\mu, \frac{1}{\tau^2}) \\
+\mu_i &\sim \mathcal{N}(\alpha, \beta) \\
+\tau_i^2 &\sim Gamma(s, \lambda)
+\end{align}
+$$
+
+Where:
+
+* $\alpha=0$, since we do not know if the price is up or down trending a priori
+* $\beta= 100 \cdot \mathbb{V}ar[\mathbb{E(r_i)}]$ standard deviation of the asset average returns
+* shape $s$ and rate $\lambda$ are chosen such that $\mathbb{E}[\tau^2] = \mathbb{E}[1 / \mathbb{V}ar(r_i)]$ and $\mathbb{V}ar[\tau^2] = \mathbb{V}ar[1 / \mathbb{V}ar(r_i)]$
+
+Please notice that in the case of a gamma distribution $\lambda = \mathbb{E}[\tau^2] / \mathbb{V}ar[\tau^2]$ and $s = {\mathbb{E}[\tau^2]}^2 / \mathbb{V}ar[\tau^2]$.
+
+```{r} 
+train_returns <- log_returns[train_index[-1],]
+test_returns <- log_returns[test_index[-length(test_index)],]
+
+alpha = 0
+beta <- 100 * var(colMeans(train_returns))
+
+E = mean(1 / apply(train_returns, 2, var))
+V = var(1 / apply(train_returns, 2, var))
+lambda <- E / V
+s <- E^2 / V
+```
+
+```{r, echo=FALSE}
+knitr::kable(data.frame(alpha=alpha, beta=beta, lambda=lambda, s=s))
+```
+
+We can then compare the prior distributions we chose with the empirical distribution captured in the data.
+
+```{r, echo=FALSE, fig.width = 7, fig.height=3, out.width = '100%', warning=FALSE}
+data.frame(AvgReturns = colMeans(train_returns)) %>%
+  ggplot(aes(x=AvgReturns)) +
+  geom_point(aes(y=0, shape="x"), size=3, col='#619CFF') +
+  geom_density(aes(col='#F8766D'), lwd=1.15) + 
+  stat_function(aes(col='#00BA38'), fun = function(x) dnorm(x, 0, sqrt(beta)), lty=2, lwd=1.15)+
+  scale_shape_manual(name = '',values =c("x"=17), labels = c('Samples')) + 
+  xlim(-.075, .075) + 
+  labs(y='Density', title=TeX('$\\mu$ - Average Returns Distribution')) + 
+  scale_colour_manual(name = '',values =c('#00BA38'='#00BA38', '#F8766D'='#F8766D'), 
+                      labels = c('Pior Normal', 'Empirical'))
+
+data.frame(Precision = 1 / apply(train_returns, 2, var)) %>%
+  ggplot(aes(x=Precision)) +
+  geom_point(aes(y=0, shape="x"), size=3, col='#619CFF') +
+  geom_density(aes(col='#F8766D'), lwd=1.15) + 
+  stat_function(aes(col='#00BA38'), fun = function(x) dgamma(x, s, lambda), lty=2, lwd=1.15)+
+  scale_shape_manual(name = '',values =c("x"=17), labels = c('Samples')) + 
+  xlim(0, 350) + 
+  labs(y='Density', title=TeX('$\\tau^2$ - Precision Distribution')) + 
+  scale_colour_manual(name = '',values =c('#00BA38'='#00BA38', '#F8766D'='#F8766D'), 
+                      labels = c('Pior Gamma', 'Empirical'))
+```
+
+### JAGS Model
+
+Now that we have data, model and prior distributions we can implement a suitable MCMC simulation using JAGS. Below you can find the JAGS model used in the uncorrelated case.
+
+```
+model
+{
+  for( t in 1:N ){
+    for( i in 1:M){
+      r[t, i] ~ dnorm(mu[i], prec[i])  
+    }
+  }
+  
+  for( j  in 1:M ){
+    # Tau^2 - Precision
+    prec[j] ~ dgamma(s, lambda)
+    
+    # Mu - Average Returns
+    mu[j] ~ dnorm(alpha, 1/beta)
+    
+    # Sigma - Volatility
+    sigma[j] <- sqrt(1 / prec[j])
+    
+    # Returns Distribution
+    returns[j] ~ dnorm(mu[j], prec[j])
+    
+    # Sharpe Ratio
+    sharpe[j] <- mu[j] / sigma[j] * sqrt(12)
+  }
+}
+```
+
+```{r,  results=FALSE, warning=FALSE, message=FALSE}
+data_uncorr <- list(r = train_returns, N = dim(train_returns)[1], M = M,
+                    alpha=alpha, beta=beta, s=s, lambda=lambda)
+
+parameters_uncorr <- c('mu', 'sigma', 'sharpe', 'returns')
+
+return_jags_uncorr <- jags(data=data_uncorr,
+                           parameters.to.save=parameters_uncorr,
+                           model.file="uncorrelated_returns_jags_model",
+                           DIC = T, n.chains = 1,
+                           n.thin = 1, n.burnin=2,
+                           n.iter=10000)
+```
+
+### Convergence
+
+In order to assess the chains convergence we use the *Geweke's convergence diagnostic*. In particular below we can see top 9 variable with the highest *Z-Score* in module. In general large value of the Z-Score, e.g. $|Z| > 2$, means that the chain has not converged well.
+
+```{r, echo=FALSE, fig.width = 7, fig.height=4, out.width = '100%'}
+uncorr_returns_mcmc <- as.mcmc(return_jags_uncorr)
+
+gewek <- geweke.diag(uncorr_returns_mcmc)
+highest_gewek <- gewek[[1]]$z[order(abs(gewek[[1]]$z), decreasing = TRUE)][1:9]
+knitr::kable(t(data.frame("Z-Score"=highest_gewek)))
+
+uncorr_returns_ggs <- ggs(uncorr_returns_mcmc)
+dugongjags_ggs_filt <- uncorr_returns_ggs %>% filter(Parameter %in% names(highest_gewek))
+ggs_running(dugongjags_ggs_filt, greek = T)+
+  aes(color = Parameter) +
+  facet_wrap(~ Parameter, scale='free_y', nrow = 3)
+```
+
+However, if we look at the autocorrelation of those variables we can see that they are all stable around $0$ and the running means actually converge to a fixed point.
+
+```{r, echo=FALSE, fig.width = 7, fig.height=4, out.width = '100%'}
+mcmc_acf(return_jags_uncorr$BUGSoutput$sims.matrix[,names(highest_gewek)])
+```
+
+
+### MCMC Results
+
+#### $\mu$ - Expected Returns
+
+Below we can see the distribution of the expected return $\mu_i$ for each asset $i$ as well as the $95\%$ equal tail interval delimited by the dashed red vertical lines.
+
+```{r, echo=FALSE, out.width = '100%', fig.width = 11, fig.height=5, warning=FALSE, message=FALSE}
+filter_dataframe <- function(df, variable){
+  if (variable == 'Sigma'){
+    M <- sqrt(ncol(as.data.frame(df[, startsWith(colnames(df), paste0(variable, '['))])))
+    filt_df <- as.data.frame(sqrt(df[, paste0('Sigma[', 1:M, ',', 1:M, ']')]))
+    num_index <- 1:M
+  }
+  else{
+    filt_df <- as.data.frame(df[, startsWith(colnames(df), paste0(variable, '['))])
+    num_index <- as.numeric(substr(colnames(filt_df), 
+                                   nchar(variable)+2, 
+                                   nchar(colnames(filt_df))-1))
+  }
+  colnames(filt_df) <- tickers[num_index]
+  filt_df
+}
+
+plot_distribution <- function(bugs_output, variable, vline=FALSE, scales='free_x', bounds=FALSE){
+  filt_df <- filter_dataframe(bugs_output$sims.array[,1,], variable)
+  melted_filt_df <- melt(filt_df)
+  colnames(melted_filt_df)[colnames(melted_filt_df) == 'variable'] <- 'Stock' 
+  gg <- melted_filt_df %>%
+      ggplot(aes(x = value, fill=Stock)) +
+      geom_density(alpha=.5)
+  
+  if(vline){
+     gg <- gg +
+      geom_vline(xintercept = 0, lty=2, alpha=.75)
+  }
+  
+  if(bounds){
+    summ_df <- filter_dataframe(t(bugs_output$summary), variable)[c('2.5%', '97.5%'),]
+    summ_df$bound <- row.names(summ_df)
+    melt_summ_df <- summ_df %>% melt(id.vars = 'bound')
+    colnames(melt_summ_df)[colnames(melt_summ_df) == 'variable'] <- 'Stock'
+    gg <- gg + 
+      geom_vline(aes(group= bound, xintercept = value), data = melt_summ_df, 
+                 col='red', lty=2, alpha=.5)
+  }
+  
+  gg +
+    labs(x=variable, y='Density') +
+    facet_wrap( ~ Stock, ncol = 6, scales = scales)
+}
+
+filt_mu_df <- filter_dataframe(return_jags_uncorr$BUGSoutput$sims.array[,1,], 'mu')
+plot_distribution(return_jags_uncorr$BUGSoutput, variable = 'mu', vline = TRUE, bounds = TRUE)
+caterpillar.plot(filt_mu_df, Title = 'mu parameters 95% HPDs')
+```
+
+The distribution together with the $95\%$ **HPD** intervals give us many insight on what might be the future returns. We are particularly interested in the probability that the returns are negative since we would like to avoid down trending stocks, for this reason if $\mathbb{P}(\mu_i < 0) \geq 0.025$ we won't include stock $i$ in our asset allocation.
+
+#### $\sigma$ - Volatility
+
+As we did for the expected return $\mu$ here we plot distribution and $95\%$ HPD interval of the volatility parameter $\sigma_i$ for each asset. 
+
+```{r, echo=FALSE, out.width = '100%', fig.width = 11, fig.height=5, warning=FALSE, message=FALSE}
+filt_sigma_df <- filter_dataframe(return_jags_uncorr$BUGSoutput$sims.array[,1,], 'sigma')
+plot_distribution(return_jags_uncorr$BUGSoutput, variable = 'sigma', vline = FALSE, scales='fixed')
+caterpillar.plot(filt_sigma_df, Title = 'sigma Parameters 95% HPDs')
+```
+
+As already mentioned before the parameter $\sigma$ can be thought as a parameter describing the risk associated to each stock, i.e. *PG* is safer than *TSLA* or *NVDA* since its volatility is extraordinarily lower than the latter two.
+
+#### $SR$ - Sharpe Ratio
+
+As defined above the Sharpe ratio combines expected return and volatility giving us the possibility to judge an investment using a single measure.
+
+```{r, echo=FALSE, out.width = '100%', fig.width = 11, fig.height=5, warning=FALSE, message=FALSE}
+filt_sharpe_df <- filter_dataframe(return_jags_uncorr$BUGSoutput$sims.array[,1,], 'sharpe')
+plot_distribution(return_jags_uncorr$BUGSoutput, 'sharpe', TRUE, bounds = TRUE, scales = 'fixed')
+caterpillar.plot(filt_sharpe_df, Title = 'Sharpe Parameters 95% HPDs')
+```
+
+From the plots above it is clear that companies like *AMZN*, *MSFT* and *NVDA* are a better investment than *PFE*, *BAC*, *JNJ* or *BRK-B*
+
+#### $r$ - Returns
+
+This quantity describes the posterior distribution of the log-returns $r_i$ for each asset $i$.
+
+```{r, echo=FALSE, out.width = '100%', fig.width = 11, fig.height=5, warning=FALSE, message=FALSE}
+filt_returns_df <- filter_dataframe(return_jags_uncorr$BUGSoutput$sims.array[,1,], 'returns')
+plot_distribution(return_jags_uncorr$BUGSoutput, 'returns', TRUE, scales='fixed', bounds = TRUE)
+caterpillar.plot(filt_returns_df, Title = 'Log-Returns 95% HPDs')
+```
+
+As we can see previous considerations about volatility and expected returns of the different stock are reflected here, in particular we can notice how:
+
+* *PG* presents the lowest risk while *TSLA* the highest 
+* *NVDA* is both highly volatile and right skewed
+
+### Test on New Data
+
+Here we analyze the performance of the estimated parameters on new unseen data, specifically the monthly data from $2021-01-01$ to the $2022-06-01$. First we plot, for each asset, the log-returns $r_i$ together with the respective empirical and the posterior distribution, the latter computed above using JAGS.
+
+```{r, echo=FALSE, out.width = '100%', fig.width = 11, fig.height=5, warning=FALSE, message=FALSE}
+aux_test_returns <- as.data.frame(test_returns)
+aux_test_returns$Time <- 1:dim(aux_test_returns)[1]
+colnames(aux_test_returns)[colnames(aux_test_returns) == 'BRK.B'] <- 'BRK-B'
+aux_test_returns %>%
+  melt(id.vars='Time') %>%
+  ggplot(aes(x=Time, y=value, col=variable)) + 
+  geom_line() + 
+  geom_density(aes(x=..density..), lwd=.75, lty=2, col='black') + 
+  geom_density(data=melt(filt_returns_df), aes(x=..density.., y=value, fill=variable), alpha=.3) +
+  geom_hline(aes(yintercept=0), alpha=.7) +
+  labs(y='Returns') +
+  facet_wrap( ~ variable, ncol = 6)
+```
+
+Please notice how, in many cases, the empirical densities are really close to the posterior densities evaluated above despite the huge impact that *inflation* and *Russian invasion of Ukraine* have had on financial markets.
+
+We now compare the performance of two theoretical portfolios:
+
+* **Avg** is a portfolio in which all the assets have the same weight; while
+* **Uncorr** is a portfolio in which all the assets whose probability of negative returns, evaluated assuming uncorrelated returns, is less than $2.5\%$, $\mathbb{P}(\mu_i < 0) \leq 0.025$, are weighted proportionally to the *median expected returns* multiplied by a constant in order to sum up to $1$, $\sum_i c \hat{\mu_i} = 1$
+
+Below we can see the composition and allocation of *Uncorr* together with the cumulative returns achieved by the two portfolios.
+
+```{r, echo=FALSE, out.width = '100%', fig.width = 8, fig.height=3, warning=FALSE, message=FALSE}
+low_bound_mu <- filter_dataframe(t(return_jags_uncorr$BUGSoutput$summary), 'mu')['2.5%', ]
+
+weight_uncorr <- filter_dataframe(t(return_jags_uncorr$BUGSoutput$summary), 'mu')['50%', low_bound_mu > 0]
+weight_uncorr <- weight_uncorr / sum(weight_uncorr)
+rownames(weight_uncorr) <- 'Weight'
+knitr::kable(weight_uncorr)
+
+numeric_weight_uncorr <- as.numeric(weight_uncorr)
+
+data.frame(Uncorr = c(0, cumsum(rowSums(t(apply(test_returns[, low_bound_mu > 0], 
+                                         1, 
+                                         function(row) row * numeric_weight_uncorr))))),
+           Avg = c(0, cumsum(rowMeans(test_returns))),
+           Time = date[test_index]) %>%
+  melt(id.vars='Time') %>%
+  ggplot(aes(x=Time, y=value, col=variable)) + 
+  geom_line() +
+  labs(y='Cumulative Returns')
+```
+
+As we can see *Uncorr* achieves almost always higher returns however also its volatility is higher, indeed, if we compute the Sharpe ratio for both the portfolios we would notice that *Avg* shows an higher value. 
+
+```{r, echo=FALSE}
+knitr::kable(data.frame(Uncorr = sharpe(cumsum(rowSums(t(apply(test_returns[, low_bound_mu > 0], 
+                                                  1, 
+                                                  function(row) row * numeric_weight_uncorr)))), scale = sqrt(12)),
+                        Avg = sharpe(cumsum(rowMeans(test_returns)), scale = sqrt(12)),
+                        row.names = 'SharpeRatio'))
+```
+
+
+
+## Correlated Noise
+
+The second model we take into account assumes correlated returns.
+
+### Prior Distributions
+
+In order to model correlations among stocks we say the the returns at time $t$ follow a multivariate normal distribution
+
+$$
+\mathbf{r}_t \sim \mathcal{N}(\boldsymbol{\mu}, \Sigma) 
+$$
+
+where $\Sigma = \Omega^{-1}$ is the variance-covariance matrix, $\boldsymbol{\mu} = [\mu_1, \dots, \mu_M]$ is the means vector and follow the following prior distributions:
+
+$$
+\mu_i \sim \mathcal{N}(\alpha, \beta) \\
+\Omega \sim Wishart(R, k)
+$$
+
+Where $\alpha$ and $\beta$ are the ones computed above.
+
+About the *Wishart distribution* notice that:
+
+1. the expectation of $\Omega$ is $kR^{-1}$, hence $R/k$ is a prior guess for the variance covariance matrix
+2. when $R$ is diagonal and $k = M +1$ the correlation parameters $\rho_{i,j}$ for $i \neq j$ have a uniform distribution over $[-1, 1]$
+
+Said that to better fit our case we set:
+
+* $k = M+1$ since we assume no prior knowledge about the correlation distribution,
+* $R = \mathbb{E}[\mathbb{V}ar(r_i)] I$ where $I$ is the $M \times M$ identity matrix.
+
+### JAGS Model
+
+Now that we have all ready we can run the MCMC simulation using JAGS and the model defined below.
+
+```
+model
+{
+  for( i in 1:N){
+    r[i, 1:M] ~ dmnorm(mu[1:M], Omega[1:M, 1:M])
+  }
+
+  # Precision Matrix
+  Omega ~ dwish(R, M+1)
+  
+  # Expected Returns
+  for( j  in 1:M){
+    mu[j] ~ dnorm(alpha, 1/beta)
+  }
+
+  # Variance-Covariance Matrix
+  Sigma <- inverse(Omega)
+  
+  # Returns Distribution
+  returns ~ dmnorm(mu[1:M], Omega[1:M, 1:M])
+
+  # Sharpe Ratio
+  for( j in 1:M){
+    sharpe[j] <- mu[j] / sqrt(Sigma[j, j]) * sqrt(12)
+  }
+}
+```
+
+```{r,  results=FALSE, warning=FALSE, message=FALSE}
+data_corr <- list(r = train_returns, N = dim(train_returns)[1], M = M,
+                    alpha=alpha, beta=beta, R=diag(M) / E)
+
+parameters_corr <- c('mu', 'Sigma', 'sharpe', 'returns')
+
+return_jags_corr <- jags(data=data_corr,
+                           parameters.to.save=parameters_corr,
+                           model.file="correlated_returns_jags_model",
+                           DIC = T, n.chains = 1,
+                           n.thin = 1, n.burnin=2,
+                           n.iter=10000)
+```
+
+### Convergence
+ 
+In order to assess the chains convergence we proceed as before looking at the Geweke's convergence diagnostic.
+
+```{r, echo=FALSE, fig.width = 7, fig.height=4, out.width = '100%'}
+corr_returns_mcmc <- as.mcmc(return_jags_corr)
+
+gewek <- geweke.diag(corr_returns_mcmc)
+highest_gewek <- gewek[[1]]$z[order(abs(gewek[[1]]$z), decreasing = TRUE)][1:9]
+knitr::kable(t(data.frame("Z-Score"=highest_gewek)))
+
+corr_returns_ggs <- ggs(corr_returns_mcmc)
+corr_returns_ggs_filt <- corr_returns_ggs %>% filter(Parameter %in% names(highest_gewek))
+ggs_running(corr_returns_ggs_filt, greek = T)+
+  aes(color = Parameter) +
+  facet_wrap(~ Parameter, scale='free_y', nrow = 3)
+```
+
+The same considerations done above can be repeated in this case.
+
+```{r, echo=FALSE, fig.width = 7, fig.height=4, out.width = '100%'}
+mcmc_acf(return_jags_corr$BUGSoutput$sims.matrix[,names(highest_gewek)])
+```
+
+
+### MCMC Results
+
+*As we will see in many cases the distributions of $\mu, \sigma, SR$ and $r$ retrieved in the case of* ***uncorrelated*** *and* ***correlated***  *returns are almost equal with the only exception of the covariances as we will discuss later.*
+
+#### $\mu$ - Expected Returns
+
+As we can see the results we get in this case are almost identical to the uncorrelated case, however some stocks who previously have shown $\mathbb{P}(\mu_i < 0)$ barely over $0.025$ now result to be lower therefore them won't be included in the portfolio allocation. 
+
+```{r, echo=FALSE, out.width = '100%', fig.width = 11, fig.height=5, warning=FALSE, message=FALSE}
+filt_mu_df <- filter_dataframe(return_jags_corr$BUGSoutput$sims.array[,1,], 'mu')
+plot_distribution(return_jags_corr$BUGSoutput, variable = 'mu', vline = TRUE, bounds = TRUE)
+caterpillar.plot(filt_mu_df, Title = 'mu parameters 95% HPDs')
+```
+
+#### $\Sigma$ - Variance-Covariance Matrix
+
+First we analyze the **volatilities** evaluating the standard deviation of each stock, $\sigma_i =  \sqrt{\Sigma_{i,i}}$, and also here the distributions are indistinguishable from what we had in the uncorrelated model.
+
+```{r, echo=FALSE, out.width = '100%', fig.width = 11, fig.height=5, warning=FALSE, message=FALSE}
+filt_sigma_df <- filter_dataframe(return_jags_corr$BUGSoutput$sims.array[,1,], 'Sigma')
+plot_distribution(return_jags_corr$BUGSoutput, variable = 'Sigma', vline = FALSE, scales='fixed')
+caterpillar.plot(filt_sigma_df, Title = 'sigma Parameters 95% HPDs')
+```
+
+The main difference between the two model is the presence of information about the **correlations** among the stocks. 
+
+```{r}
+Sigma <- matrix(0, nrow = M, ncol = M, dimnames = list(tickers, tickers))
+
+for (i in 1:M){
+  for (j in 1:M){
+    Sigma[i, j] <- return_jags_corr$BUGSoutput$summary[paste0('Sigma[', i, ',', j, ']'), 'mean']
+  }
+}
+
+rho <- cov2cor(Sigma)
+```
+
+Below we can see the mean correlation matrix and that it is able to recover the empirical correlation evaluated in the *EDA*. 
+
+```{r, cache=TRUE, echo=FALSE, fig.align='center'}
+corrplot(rho, type="upper", 
+         col=brewer.pal(n=10, name="RdBu"))
+```
+
+There can be found many aspects we already pointed out before, i.e. the low correlation of *PG* as well as the almost perfect correlation between *GOOGL-GOOG*, *JPM-BAC* or *V-MA*
+
+#### $SR$ - Sharpe Ratio
+
+For both the Sharpe ratio and the log-returns the considerations done above in the uncorrelated case hold here.
+
+```{r, echo=FALSE, out.width = '100%', fig.width = 11, fig.height=5, warning=FALSE, message=FALSE}
+filt_sharpe_df <- filter_dataframe(return_jags_corr$BUGSoutput$sims.array[,1,], 'sharpe')
+plot_distribution(return_jags_corr$BUGSoutput, 'sharpe', TRUE, bounds = TRUE)
+caterpillar.plot(filt_sharpe_df, Title = 'Sharpe Parameters 95% HPDs')
+```
+
+#### $r$ - Returns
+
+```{r, echo=FALSE, out.width = '100%', fig.width = 11, fig.height=5, warning=FALSE, message=FALSE}
+filt_returns_df <- filter_dataframe(return_jags_corr$BUGSoutput$sims.array[,1,], 'returns')
+plot_distribution(return_jags_corr$BUGSoutput, 'returns', TRUE, scales='fixed', bounds = TRUE)
+caterpillar.plot(filt_returns_df, Title = 'Log-Returns 95% HPDs')
+```
+
+### Test on New Data
+
+Here we proceed testing our inferential findings on unseen data. 
+
+```{r, echo=FALSE, out.width = '100%', fig.width = 11, fig.height=5, warning=FALSE, message=FALSE}
+aux_test_returns <- as.data.frame(test_returns)
+aux_test_returns$Time <- 1:dim(aux_test_returns)[1]
+colnames(aux_test_returns)[colnames(aux_test_returns) == 'BRK.B'] <- 'BRK-B'
+aux_test_returns %>%
+  melt(id.vars='Time') %>%
+  ggplot(aes(x=Time, y=value, col=variable)) + 
+  geom_line() + 
+  geom_density(aes(x=..density..), lwd=.75, lty=2, col='black') + 
+  geom_density(data=melt(filt_returns_df), aes(x=..density.., y=value, fill=variable), alpha=.3) +
+  geom_hline(aes(yintercept=0), alpha=.7) +
+  labs(y='Returns') +
+  facet_wrap( ~ variable, ncol = 6)
+```
+
+Like in the uncorrelated model also here the posterior log-return densities provide  in many, *but not all*, cases a good approximation for the test return distributions despite the recent macroeconomic shocks.
+
+```{r, echo=FALSE, out.width = '100%', fig.width = 8, fig.height=3, warning=FALSE, message=FALSE}
+low_bound_mu_corr <- filter_dataframe(t(return_jags_corr$BUGSoutput$summary), 'mu')['2.5%', ]
+
+weight_corr <- filter_dataframe(t(return_jags_corr$BUGSoutput$summary), 'mu')['50%', low_bound_mu_corr > 0]
+weight_corr <- weight_corr / sum(weight_corr)
+rownames(weight_corr) <- 'Weight'
+knitr::kable(weight_corr)
+
+numeric_weight_corr <- as.numeric(weight_corr)
+
+data.frame(Uncorr = c(0, cumsum(rowSums(t(apply(test_returns[, low_bound_mu > 0], 
+                                         1, function(row) row * numeric_weight_uncorr))))),
+           Avg = c(0, cumsum(rowMeans(test_returns))),
+           Corr = c(0, cumsum(rowSums(t(apply(test_returns[, low_bound_mu_corr > 0], 
+                                         1, function(row) row * numeric_weight_corr))))),
+           Time = date[test_index]) %>%
+  melt(id.vars='Time') %>%
+  ggplot(aes(x=Time, y=value, col=variable)) + 
+  geom_line() +
+  labs(y='Cumulative Returns')
+
+```
+
+If we analyze the performance of the **Corr** portfolio, constructed using the correlated model, we can notice that the absence of *GOOG* and *GOOGL* decreases the cumulative return and hence also the Sharpe ratio, which results to be lowest among the three portfolios.
+
+```{r, echo=FALSE}
+knitr::kable(data.frame(CorrSharpe = sharpe(cumsum(rowSums(t(apply(test_returns[, low_bound_mu_corr > 0], 
+                                                  1, 
+                                                  function(row) row * numeric_weight_corr)))), scale = sqrt(12)),
+                        UncorrSharpe = sharpe(cumsum(rowSums(t(apply(test_returns[, low_bound_mu > 0], 
+                                                  1, 
+                                                  function(row) row * numeric_weight_uncorr)))), scale = sqrt(12)),
+                        AvgSharpe = sharpe(cumsum(rowMeans(test_returns)), scale = sqrt(12)),
+                        row.names = 'SharpeRatio'))
+```
+
+## Model Comparison
+
+In order to compare the two models we can use the **DIC**, *deviance information criterion*:
+
+* *Uncorrelated Model*: $DIC =$ `r return_jags_uncorr$BUGSoutput$DIC` ($pD =$ `r return_jags_uncorr$BUGSoutput$pD`)
+* *Correlated Model*: $DIC =$ `r return_jags_corr$BUGSoutput$DIC` ($pD =$ `r return_jags_corr$BUGSoutput$pD`)
+
+As we can see the model using **correlated** returns achieves better performance, according to this measure, despite the greater penalty derived by the larger number of parameters used. Moreover, although we haven't used them, the covariance parameters inferred can be used to construct a portfolio more resilient to shocks and with a lower risk.
+

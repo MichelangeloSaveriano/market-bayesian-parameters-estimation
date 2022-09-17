@@ -1,0 +1,25 @@
+model
+{
+  for( i in 1:N){
+    r[i, 1:M] ~ dmnorm(mu[1:M], Omega[1:M, 1:M])
+  }
+
+  # Precision Matrix
+  Omega ~ dwish(R, M+1)
+  
+  # Expected Returns
+  for( j  in 1:M){
+    mu[j] ~ dnorm(alpha, 1/beta)
+  }
+
+  # Variance-Covariance Matrix
+  Sigma <- inverse(Omega)
+  
+  # Returns Distribution
+  returns ~ dmnorm(mu[1:M], Omega[1:M, 1:M])
+
+  # Sharpe Ratio
+  for( j in 1:M){
+    sharpe[j] <- mu[j] / sqrt(Sigma[j, j]) * sqrt(12)
+  }
+}
